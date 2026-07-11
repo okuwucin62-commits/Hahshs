@@ -1,0 +1,202 @@
+name: Build AEGIS APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------- DIAGNOSTIC: show what is in the repo ----------
+      - name: List repository files
+        run: |
+          echo "===== FILES IN REPOSITORY ROOT ====="
+          ls -la
+          echo ""
+          echo "===== ALL .zip FILES ====="
+          find . -iname "*.zip" -not -path "*/.git/*" || echo "NO ZIP FOUND"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.29.0
+          cache: true
+
+      # ---------- MAIN: extract, heal, build ----------
+      - name: Extract, auto-heal and build
+        run: |
+          exec > >(tee DIAGNOSIS.txt) 2>&1
+          set +e
+          echo "===== AEGIS BUILD $(date) ====="
+
+          # 1) Extract the ZIP.
+          ZIP=$(find . -iname "*.zip" -not -path "*/.git/*" | head -n1)
+          if [ -z "$ZIP" ]; then
+            echo ">>> ERROR: no .zip file in the repo. Upload aegis-project.zip."
+            exit 0
+          fi
+          echo "Extracting: $ZIP"
+          rm -rf _src
+          mkdir -p _src
+          unzip -o -q "$ZIP" -d _src
+
+          # 2) Find the shallowest pubspec.yaml (the Flutter project root).
+          PUBSPEC=$(find _src . -name pubspec.yaml -not -path "*/build/*" \
+            -not -path "*/.dart_tool/*" -not -path "*/.git/*" -printf '%d %p\n' \
+            | sort -n | head -n1 | cut -d' ' -f2-)
+          if [ -z "$PUBSPEC" ]; then
+            echo ">>> ERROR: no pubspec.yaml found inside the ZIP."
+            echo "Contents of _src:"; find _src -maxdepth 3 | head -50
+            exit 0
+          fi
+          PROJECT_DIR=$(dirname "$PUBSPEC")
+          echo "Flutter project found at: $PROJECT_DIR"
+          cd "$PROJECT_DIR"
+
+          # 3) AUTO-HEAL the known errors so any ZIP version builds.
+          echo "--- healing ---"
+
+          # 3a) Version-stable notification service (no zonedSchedule).
+          mkdir -p lib/engines/notifications
+          cat > lib/engines/notifications/notification_service.dart <<'DART'
+          import 'dart:async';
+          import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+
+          class NotificationService {
+            final FlutterLocalNotificationsPlugin _plugin =
+                FlutterLocalNotificationsPlugin();
+            bool _initialized = false;
+            final Map<int, Timer> _timers = {};
+
+            Future<void> initialize() async {
+              if (_initialized) return;
+              const android = AndroidInitializationSettings('@mipmap/ic_launcher');
+              const settings = InitializationSettings(android: android);
+              await _plugin.initialize(settings);
+              try {
+                final impl = _plugin.resolvePlatformSpecificImplementation<
+                    AndroidFlutterLocalNotificationsPlugin>();
+                await impl?.requestNotificationsPermission();
+              } catch (_) {}
+              _initialized = true;
+            }
+
+            NotificationDetails get _details => const NotificationDetails(
+                  android: AndroidNotificationDetails(
+                    'aegis_reminders', 'AEGIS Reminders',
+                    channelDescription: 'Scheduled reminders from AEGIS',
+                    importance: Importance.high, priority: Priority.high,
+                  ),
+                );
+
+            Future<void> schedule({
+              required int id, required String title,
+              required String body, required DateTime when,
+            }) async {
+              if (!_initialized) await initialize();
+              final delay = when.difference(DateTime.now());
+              if (delay.inMilliseconds <= 2000) {
+                await _plugin.show(id, title, body, _details);
+                return;
+              }
+              _timers[id]?.cancel();
+              _timers[id] = Timer(delay, () async {
+                try { await _plugin.show(id, title, body, _details); } catch (_) {}
+                _timers.remove(id);
+              });
+            }
+
+            Future<void> showNow(String title, String body) async {
+              if (!_initialized) await initialize();
+              await _plugin.show(
+                DateTime.now().millisecondsSinceEpoch.remainder(100000),
+                title, body,
+                const NotificationDetails(
+                  android: AndroidNotificationDetails('aegis_general', 'AEGIS'),
+                ),
+              );
+            }
+
+            Future<void> cancel(int id) async {
+              _timers.remove(id)?.cancel();
+              if (_initialized) { try { await _plugin.cancel(id); } catch (_) {} }
+            }
+          }
+          DART
+          sed -i 's/^          //' lib/engines/notifications/notification_service.dart
+
+          # 3b) providers.dart must import models.dart (ChatMessageFactory).
+          if [ -f lib/core/di/providers.dart ] && grep -q "ChatMessageFactory" lib/core/di/providers.dart; then
+            grep -q "repositories/models.dart" lib/core/di/providers.dart || \
+              sed -i "s#import '../../data/repositories/chat_repository.dart';#import '../../data/repositories/chat_repository.dart';\nimport '../../data/repositories/models.dart';#" lib/core/di/providers.dart
+          fi
+
+          # 3c) initialValue: -> value:  (Flutter 3.29 dropdown API)
+          grep -rl "initialValue:" lib --include=*.dart 2>/dev/null | while read f; do
+            sed -i 's/initialValue:/value:/g' "$f"
+          done
+
+          # 3d) remove timezone usage (no longer needed)
+          grep -rl "package:timezone" lib --include=*.dart 2>/dev/null | while read f; do
+            sed -i "/package:timezone/d; /tz\.initializeTimeZones/d" "$f"
+          done
+          sed -i '/^  timezone:/d' pubspec.yaml
+          sed -i 's/flutter_local_notifications: .*/flutter_local_notifications: ^17.2.3/' pubspec.yaml
+
+          echo "--- healed ---"
+
+          # 4) Android scaffolding + custom config + compileSdk 36.
+          mkdir -p /tmp/bk && [ -d android ] && cp -r android /tmp/bk/
+          flutter create --platforms=android --org ai.aegis .
+          if [ -d /tmp/bk/android ]; then
+            rm -rf android/app/src/main/kotlin android/app/src/main/java
+            cp -r /tmp/bk/android/* android/ 2>/dev/null
+          fi
+          rm -f android/settings.gradle.kts android/build.gradle.kts android/app/build.gradle.kts
+          if [ -f android/app/build.gradle ]; then
+            sed -i 's/compileSdk = 34/compileSdk = 36/; s/compileSdk 34/compileSdk 36/' android/app/build.gradle
+            # flutter_tts requires minSdk 24 — force it regardless of ZIP version.
+            sed -i 's/minSdk = 23/minSdk = 24/; s/minSdk 23/minSdk 24/' android/app/build.gradle
+          fi
+
+          # 5) Build.
+          echo "--- flutter pub get ---"
+          flutter pub get || { echo ">>> pub get FAILED"; exit 0; }
+          echo "--- flutter build apk ---"
+          flutter build apk --release || { echo ">>> APK BUILD FAILED"; exit 0; }
+
+          APK=$(find build/app/outputs/flutter-apk -name "app-release.apk" | head -n1)
+          if [ -n "$APK" ]; then
+            cp "$APK" "$GITHUB_WORKSPACE/AEGIS.apk"
+            echo "SUCCESS: APK built ($(du -h "$GITHUB_WORKSPACE/AEGIS.apk" | cut -f1))"
+          else
+            echo ">>> No APK file produced."
+          fi
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: AEGIS build ${{ github.run_number }}
+          body: "Download AEGIS.apk and install it. If only DIAGNOSIS.txt is here, open it and send the text."
+          files: |
+            AEGIS.apk
+            DIAGNOSIS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
